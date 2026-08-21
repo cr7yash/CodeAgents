@@ -1,11 +1,14 @@
 """Tests for base agent functionality."""
 
-import pytest
-from unittest.mock import AsyncMock, MagicMock, patch
+import json
+from unittest.mock import AsyncMock, patch
 
-from src.agents.base import BaseAgent, FindingsOutput
-from src.models.finding import Finding, Severity
+import pytest
+
+from src.agents.base import BaseAgent
+from src.models.finding import Severity
 from src.models.review import AgentResult
+from src.providers.base import GenerationResult
 
 
 class ConcreteAgent(BaseAgent):
@@ -117,42 +120,137 @@ class TestBaseAgent:
         """Test successful analysis."""
         agent = ConcreteAgent()
 
-        mock_response = FindingsOutput(
-            findings=[
-                {
-                    "severity": "high",
-                    "category": "test",
-                    "title": "Test Issue",
-                    "description": "Test description",
-                    "line_start": 1,
-                }
-            ],
-            summary="Found 1 issue",
+        response_text = json.dumps(
+            {
+                "findings": [
+                    {
+                        "severity": "high",
+                        "category": "test",
+                        "title": "Test Issue",
+                        "description": "Test description",
+                        "line_start": 1,
+                    }
+                ],
+                "summary": "Found 1 issue",
+            }
+        )
+        mock_result = GenerationResult(
+            text=response_text,
+            input_tokens=100,
+            output_tokens=50,
+            latency_ms=10.0,
+            model=agent.model,
+            finish_reason="stop",
         )
 
-        with patch.object(agent, "llm") as mock_llm:
-            mock_structured = MagicMock()
-            mock_structured.ainvoke = AsyncMock(return_value=mock_response)
-            mock_llm.with_structured_output.return_value = mock_structured
-
+        with patch.object(agent.provider, "generate", AsyncMock(return_value=mock_result)):
             result = await agent.analyze("x = 1", "python")
 
             assert isinstance(result, AgentResult)
             assert result.agent_name == "ConcreteAgent"
             assert len(result.findings) == 1
             assert result.summary == "Found 1 issue"
+            assert result.tokens_used == 150
+            assert result.input_tokens == 100
+            assert result.output_tokens == 50
 
     @pytest.mark.asyncio
     async def test_analyze_error_handling(self):
         """Test error handling during analysis."""
         agent = ConcreteAgent()
 
-        with patch.object(agent, "llm") as mock_llm:
-            mock_llm.with_structured_output.side_effect = Exception("API Error")
-
+        with patch.object(
+            agent.provider, "generate", AsyncMock(side_effect=Exception("API Error"))
+        ):
             result = await agent.analyze("x = 1", "python")
 
             assert isinstance(result, AgentResult)
             assert result.error is not None
             assert "API Error" in result.error
             assert len(result.findings) == 0
+
+    @pytest.mark.asyncio
+    async def test_analyze_retries_once_on_malformed_json(self):
+        """A malformed first response triggers exactly one retry."""
+        agent = ConcreteAgent()
+
+        bad_result = GenerationResult(
+            text="not json at all",
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=5.0,
+            model=agent.model,
+            finish_reason="stop",
+        )
+        good_result = GenerationResult(
+            text=json.dumps({"findings": [], "summary": "clean"}),
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=5.0,
+            model=agent.model,
+            finish_reason="stop",
+        )
+
+        mock_generate = AsyncMock(side_effect=[bad_result, good_result])
+        with patch.object(agent.provider, "generate", mock_generate):
+            result = await agent.analyze("x = 1", "python")
+
+            assert mock_generate.await_count == 2
+            assert result.summary == "clean"
+            assert result.error is None
+
+    @pytest.mark.asyncio
+    async def test_analyze_flags_empty_reasoning_response(self):
+        """An empty first response (all output spent on hidden reasoning) should
+        warn even though the retry recovers valid findings."""
+        agent = ConcreteAgent()
+
+        empty_result = GenerationResult(
+            text="",
+            input_tokens=10,
+            output_tokens=0,
+            latency_ms=5.0,
+            model=agent.model,
+            finish_reason="stop",
+        )
+        recovered_result = GenerationResult(
+            text=json.dumps({"findings": [], "summary": "no issues"}),
+            input_tokens=10,
+            output_tokens=5,
+            latency_ms=5.0,
+            model=agent.model,
+            finish_reason="stop",
+        )
+
+        mock_generate = AsyncMock(side_effect=[empty_result, recovered_result])
+        with patch.object(agent.provider, "generate", mock_generate):
+            result = await agent.analyze("x = 1", "python")
+
+            assert mock_generate.await_count == 2
+            assert any("empty response" in w for w in result.warnings)
+            assert result.error is None
+
+    @pytest.mark.asyncio
+    async def test_analyze_reports_error_when_retry_also_empty(self):
+        """If a reasoning model exhausts its budget on both attempts, the
+        result must carry both the warning and the error — never silently
+        look like a clean pass with 0 findings."""
+        agent = ConcreteAgent()
+
+        empty_result = GenerationResult(
+            text="",
+            input_tokens=10,
+            output_tokens=0,
+            latency_ms=5.0,
+            model=agent.model,
+            finish_reason="stop",
+        )
+
+        mock_generate = AsyncMock(side_effect=[empty_result, empty_result])
+        with patch.object(agent.provider, "generate", mock_generate):
+            result = await agent.analyze("x = 1", "python")
+
+            assert mock_generate.await_count == 2
+            assert result.error is not None
+            assert any("empty response" in w for w in result.warnings)
+            assert result.input_tokens == 20

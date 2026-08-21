@@ -4,80 +4,38 @@ import asyncio
 import logging
 from typing import Literal
 
-from langgraph.graph import StateGraph, START, END
+from langgraph.graph import END, START, StateGraph
+from langgraph.graph.state import CompiledStateGraph
 
+from src.agents.base import BaseAgent
+from src.agents.documentation_agent import DocumentationAgent
+from src.agents.performance_agent import PerformanceAgent
 from src.agents.quality_agent import QualityAgent
 from src.agents.security_agent import SecurityAgent
-from src.agents.performance_agent import PerformanceAgent
-from src.agents.documentation_agent import DocumentationAgent
-from src.orchestrator.state import ReviewState
-from src.orchestrator.aggregator import aggregate_results
 from src.models.report import FinalReport
-
+from src.orchestrator.aggregator import aggregate_results
+from src.orchestrator.state import ReviewState
 
 logger = logging.getLogger(__name__)
 
-# Agent instances (created once)
-quality_agent = QualityAgent()
-security_agent = SecurityAgent()
-performance_agent = PerformanceAgent()
-documentation_agent = DocumentationAgent()
 
+def _make_agent_node(agent_cls: type[BaseAgent], state_key: str, model: str | None):
+    """Build a graph node that constructs and runs one agent per invocation."""
 
-async def run_quality_agent(state: ReviewState) -> dict:
-    """Run the quality agent on the code."""
-    logger.info("Running Quality Agent...")
-    try:
-        result = await quality_agent.analyze(
-            code=state["code"],
-            language=state["language"],
-        )
-        return {"quality_result": result}
-    except Exception as e:
-        logger.error(f"Quality agent error: {e}")
-        return {"errors": [f"Quality agent error: {str(e)}"]}
+    async def node(state: ReviewState) -> dict:
+        logger.info(f"Running {agent_cls.__name__}...")
+        try:
+            agent = agent_cls(model=model)
+            result = await agent.analyze(
+                code=state["code"],
+                language=state["language"],
+            )
+            return {state_key: result}
+        except Exception as e:
+            logger.error(f"{agent_cls.__name__} error: {e}")
+            return {"errors": [f"{agent_cls.__name__} error: {str(e)}"]}
 
-
-async def run_security_agent(state: ReviewState) -> dict:
-    """Run the security agent on the code."""
-    logger.info("Running Security Agent...")
-    try:
-        result = await security_agent.analyze(
-            code=state["code"],
-            language=state["language"],
-        )
-        return {"security_result": result}
-    except Exception as e:
-        logger.error(f"Security agent error: {e}")
-        return {"errors": [f"Security agent error: {str(e)}"]}
-
-
-async def run_performance_agent(state: ReviewState) -> dict:
-    """Run the performance agent on the code."""
-    logger.info("Running Performance Agent...")
-    try:
-        result = await performance_agent.analyze(
-            code=state["code"],
-            language=state["language"],
-        )
-        return {"performance_result": result}
-    except Exception as e:
-        logger.error(f"Performance agent error: {e}")
-        return {"errors": [f"Performance agent error: {str(e)}"]}
-
-
-async def run_documentation_agent(state: ReviewState) -> dict:
-    """Run the documentation agent on the code."""
-    logger.info("Running Documentation Agent...")
-    try:
-        result = await documentation_agent.analyze(
-            code=state["code"],
-            language=state["language"],
-        )
-        return {"documentation_result": result}
-    except Exception as e:
-        logger.error(f"Documentation agent error: {e}")
-        return {"errors": [f"Documentation agent error: {str(e)}"]}
+    return node
 
 
 async def aggregate_node(state: ReviewState) -> dict:
@@ -106,12 +64,16 @@ async def aggregate_node(state: ReviewState) -> dict:
 
 def create_review_graph(
     agents: list[Literal["quality", "security", "performance", "documentation"]] | None = None,
-) -> StateGraph:
+    model: str | None = None,
+) -> CompiledStateGraph:
     """
     Create the multi-agent review workflow.
 
     Args:
         agents: List of agents to run. If None, runs all agents.
+        model: Model slug to use for every selected agent. If None, each
+            agent falls back to its own per-agent override, then the
+            configured default.
 
     Flow:
     1. START -> [selected agents] (parallel)
@@ -126,19 +88,20 @@ def create_review_graph(
     # Add aggregator node (always needed)
     workflow.add_node("aggregator", aggregate_node)
 
-    # Map agent names to their node functions
-    agent_nodes = {
-        "quality": ("quality_agent", run_quality_agent),
-        "security": ("security_agent", run_security_agent),
-        "performance": ("performance_agent", run_performance_agent),
-        "documentation": ("documentation_agent", run_documentation_agent),
+    # Map agent names to their node config
+    agent_classes = {
+        "quality": (QualityAgent, "quality_result"),
+        "security": (SecurityAgent, "security_result"),
+        "performance": (PerformanceAgent, "performance_result"),
+        "documentation": (DocumentationAgent, "documentation_result"),
     }
 
     # Add selected agent nodes
     for agent_name in agents:
-        if agent_name in agent_nodes:
-            node_name, node_func = agent_nodes[agent_name]
-            workflow.add_node(node_name, node_func)
+        if agent_name in agent_classes:
+            agent_cls, state_key = agent_classes[agent_name]
+            node_name = f"{agent_name}_agent"
+            workflow.add_node(node_name, _make_agent_node(agent_cls, state_key, model))
 
             # Add edges: START -> agent -> aggregator
             workflow.add_edge(START, node_name)
@@ -155,6 +118,7 @@ async def run_review(
     language: str,
     file_path: str | None = None,
     agents: list[str] | None = None,
+    model: str | None = None,
 ) -> FinalReport:
     """
     Run a complete code review.
@@ -164,12 +128,13 @@ async def run_review(
         language: Programming language
         file_path: Optional file path for context
         agents: Optional list of agents to run
+        model: Model slug to use for every selected agent
 
     Returns:
         FinalReport with aggregated results
     """
     # Create the graph with selected agents
-    graph = create_review_graph(agents)
+    graph = create_review_graph(agents, model=model)
 
     # Initial state
     initial_state: ReviewState = {
@@ -195,6 +160,7 @@ def run_review_sync(
     language: str,
     file_path: str | None = None,
     agents: list[str] | None = None,
+    model: str | None = None,
 ) -> FinalReport:
     """Synchronous wrapper for run_review."""
-    return asyncio.run(run_review(code, language, file_path, agents))
+    return asyncio.run(run_review(code, language, file_path, agents, model))

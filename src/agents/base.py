@@ -1,20 +1,33 @@
 """Base agent class for all code review agents."""
 
-import time
+import json
 import logging
+import time
 from abc import ABC, abstractmethod
 from typing import Any
 
-from langchain_groq import ChatGroq
-from langchain_core.messages import HumanMessage, SystemMessage
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from src.config.settings import get_settings
 from src.models.finding import Finding, Severity
 from src.models.review import AgentResult
+from src.providers import GenerationConfig, get_provider
 
 
 logger = logging.getLogger(__name__)
+
+# Maps each concrete agent's class name to its per-agent settings override.
+_MODEL_OVERRIDE_FIELDS = {
+    "QualityAgent": "quality_model",
+    "SecurityAgent": "security_model",
+    "PerformanceAgent": "performance_model",
+    "DocumentationAgent": "documentation_model",
+}
+
+_JSON_RETRY_NUDGE = (
+    "\n\nYour previous response was not valid JSON. "
+    "Respond with the JSON object only — no prose, no markdown fences."
+)
 
 
 class FindingsOutput(BaseModel):
@@ -30,14 +43,12 @@ class BaseAgent(ABC):
     Each agent specializes in a specific type of analysis.
     """
 
-    def __init__(self, model_name: str | None = None):
+    def __init__(self, model: str | None = None):
         settings = get_settings()
-        self.model_name = model_name or settings.default_model
-        self.llm = ChatGroq(
-            model=self.model_name,
-            temperature=settings.temperature,
-            api_key=settings.groq_api_key,
-        )
+        override_field = _MODEL_OVERRIDE_FIELDS.get(self.__class__.__name__)
+        override = getattr(settings, override_field, None) if override_field else None
+        self.model = model or override or settings.default_model
+        self.provider = get_provider()
         self.name = self.__class__.__name__
 
     @property
@@ -84,6 +95,28 @@ CODE TO ANALYZE:
 
 Respond ONLY with valid JSON. Do not include any other text."""
 
+    @staticmethod
+    def _extract_json(text: str) -> dict[str, Any]:
+        """Extract a JSON object from model output, tolerating fences and prose."""
+        stripped = text.strip()
+        if stripped.startswith("```"):
+            stripped = stripped.split("```")[1]
+            if stripped.startswith("json"):
+                stripped = stripped[4:]
+            stripped = stripped.strip()
+
+        try:
+            return json.loads(stripped)
+        except json.JSONDecodeError:
+            pass
+
+        start = stripped.find("{")
+        end = stripped.rfind("}")
+        if start != -1 and end != -1 and end > start:
+            return json.loads(stripped[start : end + 1])
+
+        raise json.JSONDecodeError("No JSON object found", stripped, 0)
+
     async def analyze(
         self,
         code: str,
@@ -102,45 +135,90 @@ Respond ONLY with valid JSON. Do not include any other text."""
             AgentResult with findings and metadata
         """
         start_time = time.time()
-        tokens_used = 0
+        settings = get_settings()
+        prompt = self._build_analysis_prompt(code, language)
+        config = GenerationConfig(
+            temperature=settings.temperature,
+            max_tokens=settings.max_output_tokens,
+            reasoning_effort=settings.reasoning_effort,
+        )
+
+        warnings: list[str] = []
+        total_input_tokens = 0
+        total_output_tokens = 0
+
+        def _flag(result) -> None:
+            if result.is_empty or result.truncated:
+                reason = "empty response" if result.is_empty else "truncated response"
+                warnings.append(
+                    f"{self.name}: {reason} from {self.model} "
+                    f"(finish_reason={result.finish_reason})"
+                )
 
         try:
-            # Build messages
-            messages = [
-                SystemMessage(content=self.system_prompt),
-                HumanMessage(content=self._build_analysis_prompt(code, language)),
-            ]
+            result = await self.provider.generate(
+                prompt=prompt,
+                model=self.model,
+                config=config,
+                system_prompt=self.system_prompt,
+            )
+            _flag(result)
+            total_input_tokens += result.input_tokens
+            total_output_tokens += result.output_tokens
 
-            # Run analysis with structured output
-            structured_llm = self.llm.with_structured_output(FindingsOutput)
-            response = await structured_llm.ainvoke(messages)
+            try:
+                parsed = FindingsOutput.model_validate(self._extract_json(result.text))
+            except (json.JSONDecodeError, ValidationError):
+                result = await self.provider.generate(
+                    prompt=prompt + _JSON_RETRY_NUDGE,
+                    model=self.model,
+                    config=config,
+                    system_prompt=self.system_prompt,
+                )
+                _flag(result)
+                total_input_tokens += result.input_tokens
+                total_output_tokens += result.output_tokens
+                parsed = FindingsOutput.model_validate(self._extract_json(result.text))
 
-            # Track token usage from response metadata if available
-            tokens_used = getattr(response, "usage_metadata", {}).get("total_tokens", 0)
-
-            # Parse findings
-            findings = self._parse_findings(response.findings)
-
+            findings = self._parse_findings(parsed.findings)
             execution_time_ms = (time.time() - start_time) * 1000
+            cost_usd, pricing_known = self.provider.estimate_cost(
+                self.model, total_input_tokens, total_output_tokens
+            )
 
             return AgentResult(
                 agent_name=self.name,
                 findings=findings,
-                summary=response.summary,
+                summary=parsed.summary,
                 execution_time_ms=round(execution_time_ms, 2),
-                tokens_used=tokens_used,
+                tokens_used=total_input_tokens + total_output_tokens,
+                model=self.model,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cost_usd=round(cost_usd, 6),
+                pricing_known=pricing_known,
+                warnings=warnings,
             )
 
         except Exception as e:
             logger.error(f"Error in {self.name} analysis: {e}")
             execution_time_ms = (time.time() - start_time) * 1000
+            cost_usd, pricing_known = self.provider.estimate_cost(
+                self.model, total_input_tokens, total_output_tokens
+            )
 
             return AgentResult(
                 agent_name=self.name,
                 findings=[],
                 summary=f"Analysis failed: {str(e)}",
                 execution_time_ms=round(execution_time_ms, 2),
-                tokens_used=tokens_used,
+                tokens_used=total_input_tokens + total_output_tokens,
+                model=self.model,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                cost_usd=round(cost_usd, 6),
+                pricing_known=pricing_known,
+                warnings=warnings,
                 error=str(e),
             )
 

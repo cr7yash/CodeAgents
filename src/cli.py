@@ -18,6 +18,7 @@ from rich.markdown import Markdown
 from src.config.settings import get_settings
 from src.orchestrator.graph import run_review
 from src.models.report import FinalReport
+from src.providers.portkey_catalog import FAMILY_LABELS, all_models, families, find_any, models_for_family
 
 
 console = Console()
@@ -144,11 +145,27 @@ def print_report_text(report: FinalReport) -> None:
 
     # Metadata
     console.print()
+    cost_str = (
+        f"${report.metadata.total_cost_usd:.4f}"
+        if report.metadata.pricing_known
+        else "unpriced"
+    )
     console.print(
         f"[dim]Agents: {', '.join(report.metadata.agents_used)} | "
         f"Time: {report.metadata.total_execution_time_ms:.0f}ms | "
-        f"Tokens: {report.metadata.tokens_used}[/]"
+        f"Tokens: {report.metadata.tokens_used} "
+        f"({report.metadata.input_tokens} in / {report.metadata.output_tokens} out) | "
+        f"Cost: {cost_str}[/]"
     )
+    if report.metadata.models_used:
+        models_str = ", ".join(
+            f"{agent}={model}" for agent, model in report.metadata.models_used.items()
+        )
+        console.print(f"[dim]Models: {models_str}[/]")
+    if report.metadata.warnings:
+        console.print()
+        for warning in report.metadata.warnings:
+            console.print(f"[yellow]Warning: {warning}[/]")
 
 
 def format_report_json(report: FinalReport) -> str:
@@ -222,18 +239,36 @@ def format_report_markdown(report: FinalReport) -> str:
                     "",
                 ])
 
+    cost_str = (
+        f"${report.metadata.total_cost_usd:.4f}"
+        if report.metadata.pricing_known
+        else "unpriced"
+    )
     lines.extend([
         "---",
         "",
         f"*Agents: {', '.join(report.metadata.agents_used)} | "
-        f"Time: {report.metadata.total_execution_time_ms:.0f}ms*",
+        f"Time: {report.metadata.total_execution_time_ms:.0f}ms | "
+        f"Tokens: {report.metadata.tokens_used} "
+        f"({report.metadata.input_tokens} in / {report.metadata.output_tokens} out) | "
+        f"Cost: {cost_str}*",
     ])
+
+    if report.metadata.models_used:
+        models_str = ", ".join(
+            f"{agent}={model}" for agent, model in report.metadata.models_used.items()
+        )
+        lines.append(f"*Models: {models_str}*")
+
+    if report.metadata.warnings:
+        lines.extend(["", "**Warnings:**", ""])
+        lines.extend(f"- {w}" for w in report.metadata.warnings)
 
     return "\n".join(lines)
 
 
 @click.group()
-@click.version_option(version="0.1.0")
+@click.version_option(version="0.2.0")
 def main():
     """CodeAgents: Multi-agent code review system."""
     pass
@@ -265,6 +300,11 @@ def main():
     help="Comma-separated list of agents to run (quality,security,performance,documentation)",
 )
 @click.option(
+    "-m",
+    "--model",
+    help="Model slug to use for every agent (run `codeagents models` to list options)",
+)
+@click.option(
     "--severity",
     type=click.Choice(["critical", "high", "medium", "low", "info"]),
     help="Minimum severity to report",
@@ -281,11 +321,19 @@ def review(
     output: Optional[str],
     output_format: str,
     agents: Optional[str],
+    model: Optional[str],
     severity: Optional[str],
     verbose: bool,
 ):
     """Run a code review on a file or directory."""
     setup_logging(verbose)
+
+    if model and find_any(model) is None:
+        console.print(
+            f"[red]Error: unknown model '{model}'. "
+            f"Run `codeagents models` to see available models.[/]"
+        )
+        sys.exit(1)
 
     file_path = Path(path)
 
@@ -309,12 +357,12 @@ def review(
     if agents:
         agent_list = [a.strip() for a in agents.split(",")]
 
-    # Check for GROQ API key
+    # Check for Portkey gateway key
     settings = get_settings()
-    if not settings.groq_api_key:
+    if not settings.portkey_api_key:
         console.print(
-            "[red]Error: GROQ_API_KEY not set. "
-            "Please set GROQ_API_KEY in .env or environment.[/]"
+            "[red]Error: PORTKEY_API_KEY not set. "
+            "Please set PORTKEY_API_KEY in .env or environment.[/]"
         )
         sys.exit(1)
 
@@ -333,6 +381,7 @@ def review(
                     language=lang,
                     file_path=str(file_path),
                     agents=agent_list,
+                    model=model,
                 )
             )
         except Exception as e:
@@ -410,6 +459,37 @@ def agents():
     )
 
     console.print(table)
+
+
+@main.command()
+def models():
+    """List every model reachable through the Portkey gateway."""
+    table = Table(title="Available Models", show_header=True, show_lines=False)
+    table.add_column("Family", style="bold")
+    table.add_column("Slug")
+    table.add_column("Temp", justify="center")
+    table.add_column("Top P", justify="center")
+    table.add_column("Stop", justify="center")
+    table.add_column("Reasoning", justify="center")
+    table.add_column("Priced", justify="center")
+
+    def _mark(value: bool) -> str:
+        return "[green]yes[/]" if value else "[dim]no[/]"
+
+    for family in families():
+        for spec in models_for_family(family):
+            table.add_row(
+                FAMILY_LABELS[family],
+                spec.slug,
+                _mark(spec.caps.temperature),
+                _mark(spec.caps.top_p),
+                _mark(spec.caps.stop),
+                _mark(spec.caps.reasoning_effort),
+                _mark(spec.pricing is not None),
+            )
+
+    console.print(table)
+    console.print(f"\n[dim]{len(all_models())} models across {len(families())} families[/]")
 
 
 if __name__ == "__main__":

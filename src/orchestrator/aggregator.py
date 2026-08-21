@@ -125,13 +125,7 @@ def _deduplicate_findings(results: list[AgentResult]) -> list[AgentResult]:
                 filtered_findings.append(merged)
 
         deduplicated_results.append(
-            AgentResult(
-                agent_name=result.agent_name,
-                findings=filtered_findings,
-                summary=result.summary,
-                execution_time_ms=result.execution_time_ms,
-                tokens_used=result.tokens_used,
-            )
+            result.model_copy(update={"findings": filtered_findings})
         )
 
     return deduplicated_results
