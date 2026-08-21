@@ -45,6 +45,12 @@ class ReviewMetadata(BaseModel):
     agents_used: list[str] = Field(default_factory=list)
     total_execution_time_ms: float = 0.0
     tokens_used: int = 0
+    input_tokens: int = 0
+    output_tokens: int = 0
+    models_used: dict[str, str] = Field(default_factory=dict)
+    total_cost_usd: float = 0.0
+    pricing_known: bool = True
+    warnings: list[str] = Field(default_factory=list)
 
 
 class FinalReport(BaseModel):
@@ -71,7 +77,13 @@ class FinalReport(BaseModel):
         all_findings: list[Finding] = []
         agents_summary: dict[str, AgentSummary] = {}
         total_tokens = 0
+        total_input_tokens = 0
+        total_output_tokens = 0
         total_time_ms = 0.0
+        models_used: dict[str, str] = {}
+        total_cost_usd = 0.0
+        pricing_known = True
+        warnings: list[str] = []
 
         for result in results:
             all_findings.extend(result.findings)
@@ -81,7 +93,15 @@ class FinalReport(BaseModel):
                 execution_time_ms=result.execution_time_ms,
             )
             total_tokens += result.tokens_used
+            total_input_tokens += result.input_tokens
+            total_output_tokens += result.output_tokens
             total_time_ms += result.execution_time_ms
+            models_used[result.agent_name] = result.model
+            total_cost_usd += result.cost_usd
+            pricing_known = pricing_known and result.pricing_known
+            warnings.extend(result.warnings)
+            if result.error:
+                warnings.append(f"{result.agent_name} failed: {result.error}")
 
         # Sort findings by severity
         severity_order = {"critical": 0, "high": 1, "medium": 2, "low": 3, "info": 4}
@@ -131,6 +151,12 @@ class FinalReport(BaseModel):
                 agents_used=[r.agent_name for r in results],
                 total_execution_time_ms=round(total_time_ms, 2),
                 tokens_used=total_tokens,
+                input_tokens=total_input_tokens,
+                output_tokens=total_output_tokens,
+                models_used=models_used,
+                total_cost_usd=round(total_cost_usd, 6),
+                pricing_known=pricing_known,
+                warnings=warnings,
             ),
         )
 

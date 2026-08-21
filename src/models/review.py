@@ -13,6 +13,12 @@ class AgentResult(BaseModel):
     summary: str = ""
     execution_time_ms: float = 0.0
     tokens_used: int = 0
+    model: str = ""
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cost_usd: float = 0.0
+    pricing_known: bool = True
+    warnings: list[str] = Field(default_factory=list)
     error: str | None = None
 
     @property

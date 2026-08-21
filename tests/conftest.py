@@ -7,7 +7,7 @@ import pytest
 
 
 # Set a dummy API key for tests that don't actually call the API
-os.environ.setdefault("GROQ_API_KEY", "test-key-for-unit-tests")
+os.environ.setdefault("PORTKEY_API_KEY", "test-key-for-unit-tests")
 
 
 @pytest.fixture

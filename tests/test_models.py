@@ -164,6 +164,49 @@ class TestFinalReport:
         assert report.input.lines_of_code == 10
         assert "SecurityAgent" in report.metadata.agents_used
 
+    def test_report_surfaces_agent_errors_as_warnings(self):
+        """An agent that failed outright must not fail silently in the report."""
+        result = AgentResult(
+            agent_name="DocumentationAgent",
+            findings=[],
+            summary="Analysis failed: No JSON object found",
+            error="No JSON object found: line 1 column 1 (char 0)",
+        )
+
+        report = FinalReport.from_agent_results(
+            results=[result],
+            code="x = 1",
+            language="python",
+        )
+
+        assert any("DocumentationAgent failed" in w for w in report.metadata.warnings)
+
+    def test_report_aggregates_tokens_and_cost(self):
+        """Metadata must reflect real usage, not the pre-migration always-zero value."""
+        result = AgentResult(
+            agent_name="QualityAgent",
+            findings=[],
+            summary="clean",
+            tokens_used=150,
+            model="gpt-4o-mini",
+            input_tokens=100,
+            output_tokens=50,
+            cost_usd=0.001,
+            pricing_known=True,
+        )
+
+        report = FinalReport.from_agent_results(
+            results=[result],
+            code="x = 1",
+            language="python",
+        )
+
+        assert report.metadata.tokens_used == 150
+        assert report.metadata.input_tokens == 100
+        assert report.metadata.output_tokens == 50
+        assert report.metadata.total_cost_usd == pytest.approx(0.001)
+        assert report.metadata.models_used["QualityAgent"] == "gpt-4o-mini"
+
     def test_report_to_dict(self):
         """Test report serialization."""
         report = FinalReport.from_agent_results(

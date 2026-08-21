@@ -15,13 +15,21 @@ class Settings(BaseSettings):
         case_sensitive=False,
     )
 
-    # LLM Provider
-    groq_api_key: str = ""
-    llm_provider: str = "groq"
+    # LLM Provider (Portkey AI gateway)
+    portkey_api_key: str = ""
+    portkey_base_url: str = "https://api.portkey.ai/v1"
 
     # Model settings
-    default_model: str = "llama-3.3-70b-versatile"
+    default_model: str = "claude-sonnet-4-5"
     temperature: float = 0.7
+    max_output_tokens: int = 4000
+    reasoning_effort: str | None = None
+
+    # Per-agent model overrides; fall back to default_model when unset
+    quality_model: str | None = None
+    security_model: str | None = None
+    performance_model: str | None = None
+    documentation_model: str | None = None
 
     # Code analysis settings
     max_code_length: int = 50000
